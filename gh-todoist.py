@@ -163,6 +163,17 @@ def gh_search_assigned(since: Optional[datetime], gh_path: Optional[str]) -> lis
     )
     items.extend(json.loads(out_open))
 
+    # Fetch pull requests
+    out_prs = gh_cmd(
+        "search","prs",
+        "--assignee","@me",
+        "--state","open",
+        "--json", fields,
+        "--limit","1000",
+        gh_path=gh_path
+    )
+    items.extend(json.loads(out_prs))
+
     # Also fetch recently updated (captures closures/renames/label changes).
     if since is None:
         since = datetime.now(UTC) - timedelta(days=30)
@@ -176,6 +187,16 @@ def gh_search_assigned(since: Optional[datetime], gh_path: Optional[str]) -> lis
         gh_path=gh_path
     )
     items.extend(json.loads(out_recent))
+    out_recent_prs = gh_cmd(
+        "search","prs",
+        f"updated:>={since_q} assignee:@me",
+        "--assignee","@me",
+        "--json", fields,
+        "--limit","1000",
+        gh_path=gh_path
+    )
+    items.extend(json.loads(out_recent_prs))
+
 
     topics: dict[str, Topic] = {}
     for it in items:
