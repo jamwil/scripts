@@ -128,7 +128,7 @@ class Topic:
     body: str
     labels: list[str]
     assignees: list[str]
-    state: Literal["OPEN", "CLOSED"]
+    state: Literal["OPEN", "CLOSED", "MERGED"]
     state_reason: Optional[str]  # issues only; "completed" | "not_planned" | None
     updated_at: datetime
     closed_at: Optional[datetime]
@@ -359,17 +359,16 @@ def make_description(t: Topic) -> str:
 WONTFIX_LABELS = {"wontfix", "won't fix", "not planned", "invalid"}
 
 def disposition(t: Topic, gh_path: Optional[str]) -> Literal["open","complete","delete"]:
-    if t.state.upper() != "CLOSED":
-        return "open"
-    # Issues: use state_reason if present.
-    if not t.is_pr and t.state_reason:
-        sr = t.state_reason.lower()
-        if sr in ("completed","fixed","done"):
-            return "complete"
-        if sr in ("not_planned","not planned","wontfix"):
-            return "delete"
-    # PRs: treat merged as "complete", closed-unmerged as "complete" unless labeled wontfix-ish.
+    st = (t.state or "").upper()
+
     if t.is_pr:
+        # PRs can be OPEN, CLOSED, or MERGED
+        if st == "OPEN":
+            return "open"
+        if st == "MERGED":
+            t.merged = True
+            return "complete"
+        # CLOSED (or unknown) PRs: check actual merged status and labels
         if t.merged is None:
             t.merged = gh_pr_merged(t.url, gh_path)
         if t.merged:
@@ -377,7 +376,18 @@ def disposition(t: Topic, gh_path: Optional[str]) -> Literal["open","complete","
         if {lbl.lower() for lbl in t.labels} & WONTFIX_LABELS:
             return "delete"
         return "complete"
-    # Fallback: complete.
+
+    # Issues: only OPEN or CLOSED
+    if st != "CLOSED":
+        return "open"
+    # Closed issues: use state_reason if present
+    if t.state_reason:
+        sr = t.state_reason.lower()
+        if sr in ("completed","fixed","done"):
+            return "complete"
+        if sr in ("not_planned","not planned","wontfix"):
+            return "delete"
+    # Fallback: treat closed issue as complete
     return "complete"
 
 def idempotency_key(t: Topic) -> str:
@@ -450,6 +460,27 @@ def sync(
         existing = db_get_topic_by_gh(con, t.gh_id)
         existing_tid = existing[0] if existing else None
         existing_updated = existing[1] if existing else None
+        will_update = should_update(existing_updated, t.updated_at or datetime.now(UTC))
+
+        # Log our interpreted state for visibility
+        log.info(
+            "topic_state",
+            gh_id=t.gh_id,
+            url=t.url,
+            repo=t.repo,
+            number=t.number,
+            kind="PR" if t.is_pr else "Issue",
+            state=t.state,
+            state_reason=t.state_reason,
+            merged=t.merged,
+            labels=sorted(t.labels),
+            updated_at=t.updated_at.isoformat() if t.updated_at else None,
+            closed_at=t.closed_at.isoformat() if t.closed_at else None,
+            disposition=disp,
+            todoist_id=existing_tid,
+            local_updated=existing_updated,
+            will_update=will_update,
+        )
 
         # Upsert DB row early so we keep GH metadata even on failures.
         db_upsert_topic(
@@ -480,7 +511,7 @@ def sync(
                 continue  # failed create; don't try to update/close
         else:
             # Update if GH changed since last time.
-            if should_update(existing_updated, t.updated_at or datetime.now(UTC)):
+            if will_update:
                 if dry_run:
                     log.info("update_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid, content=content)
                     updated += 1
