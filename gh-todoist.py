@@ -352,7 +352,7 @@ def make_description(t: Topic) -> str:
     body = (t.body or "").strip()
     if body:
         # Keep desc succinct for Todoist UI
-        body = body if len(body) <= 1000 else body[:1000] + "…"
+        body = body if len(body) <= 2500 else body[:2500] + "…"
         return header + "\n" + body
     return header
 
