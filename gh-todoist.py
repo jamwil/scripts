@@ -216,7 +216,7 @@ def gh_search_assigned(since: Optional[datetime], gh_path: Optional[str]) -> lis
             state_reason=(it.get("stateReason") or None),
             updated_at=_parse_dt(it.get("updatedAt")),
             closed_at=_parse_dt(it.get("closedAt")),
-            is_pr=bool(it.get("isPullRequest")),
+            is_pr="/pull/" in (it.get("url") or ""),
         )
         topics[t.gh_id] = t  # de-dup by gh_id
     return list(topics.values())
@@ -245,6 +245,14 @@ class Todoist:
         self.base = base_url.rstrip("/")
         self.h = {"Authorization": f"Bearer {token}", "Content-Type":"application/json"}
         self.cli = httpx.Client(timeout=30)
+
+    def close(self) -> None:
+        """Close underlying HTTP client."""
+        try:
+            self.cli.close()
+        except Exception:
+            # Best-effort cleanup; ignore close errors.
+            pass
 
     def _req(
         self,
@@ -445,120 +453,124 @@ def sync(
     log.info("github_items_fetched", count=len(topics))
 
     td = Todoist(token)
-    project_id = td.resolve_project_id(project) if project else None
+    try:
+        project_id = td.resolve_project_id(project) if project else None
 
-    # Ensure labels exist globally (union of all GH labels we may use)
-    all_labels = sorted({lbl for t in topics for lbl in t.labels})
-    if not dry_run:
-        td.ensure_labels(all_labels)
+        # Ensure labels exist globally (union of all GH labels we may use)
+        all_labels = sorted({lbl for t in topics for lbl in t.labels})
+        if not dry_run:
+            td.ensure_labels(all_labels)
 
-    created = updated = completed = deleted = reopened = 0
+        created = updated = completed = deleted = reopened = 0
 
-    for t in topics:
-        disp = disposition(t, gh_path=gh)
-        # Ensure mapping record exists; update last seen GH state.
-        existing = db_get_topic_by_gh(con, t.gh_id)
-        existing_tid = existing[0] if existing else None
-        existing_updated = existing[1] if existing else None
-        will_update = should_update(existing_updated, t.updated_at or datetime.now(UTC))
+        for t in topics:
+            disp = disposition(t, gh_path=gh)
+            # Ensure mapping record exists; update last seen GH state.
+            existing = db_get_topic_by_gh(con, t.gh_id)
+            existing_tid = existing[0] if existing else None
+            existing_updated = existing[1] if existing else None
+            will_update = should_update(existing_updated, t.updated_at or datetime.now(UTC))
 
-        # Log our interpreted state for visibility
-        log.info(
-            "topic_state",
-            gh_id=t.gh_id,
-            url=t.url,
-            repo=t.repo,
-            number=t.number,
-            kind="PR" if t.is_pr else "Issue",
-            state=t.state,
-            state_reason=t.state_reason,
-            merged=t.merged,
-            labels=sorted(t.labels),
-            updated_at=t.updated_at.isoformat() if t.updated_at else None,
-            closed_at=t.closed_at.isoformat() if t.closed_at else None,
-            disposition=disp,
-            todoist_id=existing_tid,
-            local_updated=existing_updated,
-            will_update=will_update,
-        )
+            # Log our interpreted state for visibility
+            log.info(
+                "topic_state",
+                gh_id=t.gh_id,
+                url=t.url,
+                repo=t.repo,
+                number=t.number,
+                kind="PR" if t.is_pr else "Issue",
+                state=t.state,
+                state_reason=t.state_reason,
+                merged=t.merged,
+                labels=sorted(t.labels),
+                updated_at=t.updated_at.isoformat() if t.updated_at else None,
+                closed_at=t.closed_at.isoformat() if t.closed_at else None,
+                disposition=disp,
+                todoist_id=existing_tid,
+                local_updated=existing_updated,
+                will_update=will_update,
+            )
 
-        # Upsert DB row early so we keep GH metadata even on failures.
-        db_upsert_topic(
-            con,
-            gh_id=t.gh_id, gh_url=t.url, repo=t.repo, number=t.number, is_pr=t.is_pr,
-            todoist_id=existing_tid, gh_updated_at=t.updated_at.isoformat() if t.updated_at else _now_iso()
-        )
+            # Upsert DB row early so we keep GH metadata even on failures.
+            db_upsert_topic(
+                con,
+                gh_id=t.gh_id, gh_url=t.url, repo=t.repo, number=t.number, is_pr=t.is_pr,
+                todoist_id=existing_tid, gh_updated_at=t.updated_at.isoformat() if t.updated_at else _now_iso()
+            )
 
-        content = make_content(t)
-        description = make_description(t)
-        labels = list(t.labels)
+            content = make_content(t)
+            description = make_description(t)
+            labels = list(t.labels)
 
-        if not existing_tid:
-            if disp == "delete":
-                log.info("skip_create_deleted", gh_id=t.gh_id, url=t.url)
-                continue
-            if dry_run:
-                log.info("create_task_dryrun", gh_id=t.gh_id, content=content)
-                created += 1
-                continue
-            tid = td.create_task(content=content, description=description, labels=labels, project_id=project_id, xreq=idempotency_key(t))
-            if tid:
-                db_set_todoist_id(con, t.gh_id, tid)
-                existing_tid = tid
-                created += 1
-                log.info("task_created", gh_id=t.gh_id, todoist_id=tid, url=t.url)
-            else:
-                continue  # failed create; don't try to update/close
-        else:
-            # Update if GH changed since last time.
-            if will_update:
+            if not existing_tid:
+                if disp == "delete":
+                    log.info("skip_create_deleted", gh_id=t.gh_id, url=t.url)
+                    continue
                 if dry_run:
-                    log.info("update_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid, content=content)
-                    updated += 1
+                    log.info("create_task_dryrun", gh_id=t.gh_id, content=content)
+                    created += 1
+                    continue
+                tid = td.create_task(content=content, description=description, labels=labels, project_id=project_id, xreq=idempotency_key(t))
+                if tid:
+                    db_set_todoist_id(con, t.gh_id, tid)
+                    existing_tid = tid
+                    created += 1
+                    log.info("task_created", gh_id=t.gh_id, todoist_id=tid, url=t.url)
                 else:
-                    if td.update_task(existing_tid, content=content, description=description, labels=labels):
+                    continue  # failed create; don't try to update/close
+            else:
+                # Update if GH changed since last time.
+                if will_update:
+                    if dry_run:
+                        log.info("update_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid, content=content)
                         updated += 1
-                        log.info("task_updated", gh_id=t.gh_id, todoist_id=existing_tid)
-            else:
-                log.debug("no_update_needed", gh_id=t.gh_id)
-
-        # Handle closure/disposal after ensuring task exists/mapped.
-        if existing_tid:
-            # Re-open task if the GitHub topic became open again
-            if disp == "open":
-                if dry_run:
-                    log.info("reopen_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid)
-                    reopened += 1
+                    else:
+                        if td.update_task(existing_tid, content=content, description=description, labels=labels):
+                            updated += 1
+                            log.info("task_updated", gh_id=t.gh_id, todoist_id=existing_tid)
                 else:
-                    if td.reopen_task(existing_tid):
+                    log.debug("no_update_needed", gh_id=t.gh_id)
+
+            # Handle closure/disposal after ensuring task exists/mapped.
+            if existing_tid:
+                # Re-open task only when the GitHub topic changed and is now open again.
+                # This avoids counting every open task as "reopened" on each sync.
+                if disp == "open" and will_update:
+                    if dry_run:
+                        log.info("reopen_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid)
                         reopened += 1
-                        log.info("task_reopened", gh_id=t.gh_id, todoist_id=existing_tid)
-
-            match disp:
-                case "complete":
-                    if dry_run:
-                        log.info("complete_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid)
-                        completed += 1
                     else:
-                        if td.close_task(existing_tid):
+                        if td.reopen_task(existing_tid):
+                            reopened += 1
+                            log.info("task_reopened", gh_id=t.gh_id, todoist_id=existing_tid)
+
+                match disp:
+                    case "complete":
+                        if dry_run:
+                            log.info("complete_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid)
                             completed += 1
-                            log.info("task_completed", gh_id=t.gh_id, todoist_id=existing_tid)
-                case "delete":
-                    if dry_run:
-                        log.info("delete_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid)
-                        deleted += 1
-                    else:
-                        if td.delete_task(existing_tid):
+                        else:
+                            if td.close_task(existing_tid):
+                                completed += 1
+                                log.info("task_completed", gh_id=t.gh_id, todoist_id=existing_tid)
+                    case "delete":
+                        if dry_run:
+                            log.info("delete_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid)
                             deleted += 1
-                            log.info("task_deleted", gh_id=t.gh_id, todoist_id=existing_tid)
+                        else:
+                            if td.delete_task(existing_tid):
+                                deleted += 1
+                                log.info("task_deleted", gh_id=t.gh_id, todoist_id=existing_tid)
 
-        # Avoid hammering APIs if assigned list is large.
-        time.sleep(0.05)
+            # Avoid hammering APIs if assigned list is large.
+            time.sleep(0.05)
 
-    if not dry_run:
-        db_set(con, "last_sync_iso", _now_iso())
+        if not dry_run:
+            db_set(con, "last_sync_iso", _now_iso())
 
-    log.info("done", created=created, updated=updated, completed=completed, deleted=deleted, reopened=reopened, dry_run=dry_run)
+        log.info("done", created=created, updated=updated, completed=completed, deleted=deleted, reopened=reopened, dry_run=dry_run)
+    finally:
+        td.close()
 
 # ---------- entry ----------
 
