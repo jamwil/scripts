@@ -8,7 +8,7 @@
 # ]
 # ///
 """
-Cron-friendly GitHub→Todoist sync using gh(1) + Todoist REST v2.
+Cron-friendly GitHub→Todoist sync using gh(1) + Todoist API v1.
 
 Env:
   TODOIST_API_TOKEN  (required)
@@ -238,10 +238,10 @@ def gh_pr_merged(url: str, gh_path: Optional[str]) -> Optional[bool]:
         log.warning("gh_pr_merged_failed", url=url, error=str(e))
         return None
 
-# ---------- Todoist REST v2 ----------
+# ---------- Todoist API v1 ----------
 
 class Todoist:
-    def __init__(self, token: str, base_url: str = "https://api.todoist.com/rest/v2"):
+    def __init__(self, token: str, base_url: str = "https://api.todoist.com/api/v1"):
         self.base = base_url.rstrip("/")
         self.h = {"Authorization": f"Bearer {token}", "Content-Type":"application/json"}
         self.cli = httpx.Client(timeout=30)
