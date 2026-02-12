@@ -38,8 +38,8 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
-API_BASE_SYNC = "https://api.todoist.com/sync/v9"
-API_BASE_REST = "https://api.todoist.com/rest/v2"
+API_BASE_SYNC = "https://api.todoist.com/sync/v10"
+API_BASE_REST = "https://api.todoist.com/api/v1"
 
 
 def _local_tz():
@@ -240,7 +240,7 @@ def resolve_project_id_by_name(projects: Dict[str, str], name: str) -> Optional[
 
 def fetch_projects_full(token: str) -> List[Dict[str, Any]]:
     """
-    Return raw project objects from Todoist REST v2, including parent_id.
+    Return raw project objects from Todoist API v1, including parent_id.
     """
     url = f"{API_BASE_REST}/projects"
     headers = {"Authorization": f"Bearer {token}"}
@@ -370,7 +370,7 @@ def fetch_completed(
 
 def fetch_task_detail(token: str, task_id: str) -> Optional[Dict[str, Any]]:
     """
-    Fetch a single task (including completed/archived) via REST v2.
+    Fetch a single task (including completed/archived) via API v1.
     Returns the task dict or None if not found.
     """
     url = f"{API_BASE_REST}/tasks/{task_id}"
