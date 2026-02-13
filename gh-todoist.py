@@ -271,7 +271,11 @@ class Todoist:
     def get_labels(self) -> dict[str,str]:
         r = self._req("GET","/labels")
         r.raise_for_status()
-        return {lbl["name"]: lbl["id"] for lbl in r.json()}
+        data = r.json()
+        if not isinstance(data, list):
+            log.error("get_labels_unexpected_response", status=r.status_code, response_type=type(data).__name__, response=str(data)[:500])
+            raise TypeError(f"Expected list from /labels, got {type(data).__name__}: {str(data)[:200]}")
+        return {lbl["name"]: lbl["id"] for lbl in data}
 
     def ensure_labels(self, names: Iterable[str]) -> list[str]:
         # Todoist accepts label names directly on tasks; still pre-create to avoid 404s.
@@ -293,7 +297,11 @@ class Todoist:
     def get_projects(self) -> dict[str,str]:
         r = self._req("GET","/projects")
         r.raise_for_status()
-        return {p["name"]: p["id"] for p in r.json()}
+        data = r.json()
+        if not isinstance(data, list):
+            log.error("get_projects_unexpected_response", status=r.status_code, response_type=type(data).__name__, response=str(data)[:500])
+            raise TypeError(f"Expected list from /projects, got {type(data).__name__}: {str(data)[:200]}")
+        return {p["name"]: p["id"] for p in data}
 
     def resolve_project_id(self, name: Optional[str]) -> Optional[str]:
         if not name:
