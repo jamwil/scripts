@@ -326,7 +326,18 @@ class Todoist:
         log.error("task_create_failed", status=r.status_code, body=r.text)
         return None
 
-    def update_task(self, task_id: str, *, content: Optional[str]=None, description: Optional[str]=None, labels: Optional[list[str]]=None) -> bool:
+    def _is_deprecated_id(self, r: httpx.Response) -> bool:
+        """Check if response indicates a deprecated v2 ID that can't be used with v1 API."""
+        if r.status_code == 400:
+            try:
+                data = r.json()
+                return data.get("error_tag") == "V1_ID_CANNOT_BE_USED"
+            except Exception:
+                pass
+        return False
+
+    def update_task(self, task_id: str, *, content: Optional[str]=None, description: Optional[str]=None, labels: Optional[list[str]]=None) -> tuple[bool, bool]:
+        """Update a task. Returns (success, id_deprecated)."""
         body = {}
         if content is not None:
             body["content"] = content
@@ -335,33 +346,48 @@ class Todoist:
         if labels is not None:
             body["labels"] = labels
         if not body:
-            return True
+            return (True, False)
         r = self._req("POST", f"/tasks/{task_id}", json=body)
         if r.status_code in (200, 204):
-            return True
+            return (True, False)
+        if self._is_deprecated_id(r):
+            log.warning("task_update_deprecated_id", task_id=task_id)
+            return (False, True)
         log.error("task_update_failed", task_id=task_id, status=r.status_code, body=r.text)
-        return False
+        return (False, False)
 
-    def close_task(self, task_id: str) -> bool:
+    def close_task(self, task_id: str) -> tuple[bool, bool]:
+        """Close a task. Returns (success, id_deprecated)."""
         r = self._req("POST", f"/tasks/{task_id}/close")
         if r.status_code in (200, 204):
-            return True
+            return (True, False)
+        if self._is_deprecated_id(r):
+            log.warning("task_close_deprecated_id", task_id=task_id)
+            return (False, True)
         log.error("task_close_failed", task_id=task_id, status=r.status_code, body=r.text)
-        return False
+        return (False, False)
 
-    def reopen_task(self, task_id: str) -> bool:
+    def reopen_task(self, task_id: str) -> tuple[bool, bool]:
+        """Reopen a task. Returns (success, id_deprecated)."""
         r = self._req("POST", f"/tasks/{task_id}/reopen")
         if r.status_code in (200, 204):
-            return True
+            return (True, False)
+        if self._is_deprecated_id(r):
+            log.warning("task_reopen_deprecated_id", task_id=task_id)
+            return (False, True)
         log.error("task_reopen_failed", task_id=task_id, status=r.status_code, body=r.text)
-        return False
+        return (False, False)
 
-    def delete_task(self, task_id: str) -> bool:
+    def delete_task(self, task_id: str) -> tuple[bool, bool]:
+        """Delete a task. Returns (success, id_deprecated)."""
         r = self._req("DELETE", f"/tasks/{task_id}")
         if r.status_code in (200, 204):
-            return True
+            return (True, False)
+        if self._is_deprecated_id(r):
+            log.warning("task_delete_deprecated_id", task_id=task_id)
+            return (False, True)
         log.error("task_delete_failed", task_id=task_id, status=r.status_code, body=r.text)
-        return False
+        return (False, False)
 
 # ---------- sync logic ----------
 
@@ -539,7 +565,18 @@ def sync(
                         log.info("update_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid, content=content)
                         updated += 1
                     else:
-                        if td.update_task(existing_tid, content=content, description=description, labels=labels):
+                        success, id_deprecated = td.update_task(existing_tid, content=content, description=description, labels=labels)
+                        if id_deprecated:
+                            # Old v2 ID is no longer valid; clear and recreate
+                            log.info("task_id_deprecated_recreating", gh_id=t.gh_id, old_todoist_id=existing_tid)
+                            db_set_todoist_id(con, t.gh_id, None)
+                            tid = td.create_task(content=content, description=description, labels=labels, project_id=project_id, xreq=idempotency_key(t))
+                            if tid:
+                                db_set_todoist_id(con, t.gh_id, tid)
+                                existing_tid = tid
+                                created += 1
+                                log.info("task_recreated", gh_id=t.gh_id, todoist_id=tid, url=t.url)
+                        elif success:
                             updated += 1
                             log.info("task_updated", gh_id=t.gh_id, todoist_id=existing_tid)
                 else:
@@ -554,7 +591,18 @@ def sync(
                         log.info("reopen_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid)
                         reopened += 1
                     else:
-                        if td.reopen_task(existing_tid):
+                        success, id_deprecated = td.reopen_task(existing_tid)
+                        if id_deprecated:
+                            # Old v2 ID is no longer valid; clear and recreate as open task
+                            log.info("task_id_deprecated_on_reopen", gh_id=t.gh_id, old_todoist_id=existing_tid)
+                            db_set_todoist_id(con, t.gh_id, None)
+                            tid = td.create_task(content=content, description=description, labels=labels, project_id=project_id, xreq=idempotency_key(t))
+                            if tid:
+                                db_set_todoist_id(con, t.gh_id, tid)
+                                existing_tid = tid
+                                created += 1
+                                log.info("task_recreated", gh_id=t.gh_id, todoist_id=tid, url=t.url)
+                        elif success:
                             reopened += 1
                             log.info("task_reopened", gh_id=t.gh_id, todoist_id=existing_tid)
 
@@ -564,7 +612,13 @@ def sync(
                             log.info("complete_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid)
                             completed += 1
                         else:
-                            if td.close_task(existing_tid):
+                            success, id_deprecated = td.close_task(existing_tid)
+                            if id_deprecated:
+                                # Old v2 ID is no longer valid; task is already gone, just clear the ID
+                                log.info("task_id_deprecated_on_close", gh_id=t.gh_id, old_todoist_id=existing_tid)
+                                db_set_todoist_id(con, t.gh_id, None)
+                                completed += 1  # Count as completed since the goal was to close it
+                            elif success:
                                 completed += 1
                                 log.info("task_completed", gh_id=t.gh_id, todoist_id=existing_tid)
                     case "delete":
@@ -572,7 +626,13 @@ def sync(
                             log.info("delete_task_dryrun", gh_id=t.gh_id, todoist_id=existing_tid)
                             deleted += 1
                         else:
-                            if td.delete_task(existing_tid):
+                            success, id_deprecated = td.delete_task(existing_tid)
+                            if id_deprecated:
+                                # Old v2 ID is no longer valid; task is already gone, just clear the ID
+                                log.info("task_id_deprecated_on_delete", gh_id=t.gh_id, old_todoist_id=existing_tid)
+                                db_set_todoist_id(con, t.gh_id, None)
+                                deleted += 1  # Count as deleted since the goal was to remove it
+                            elif success:
                                 deleted += 1
                                 log.info("task_deleted", gh_id=t.gh_id, todoist_id=existing_tid)
 
