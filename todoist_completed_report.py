@@ -213,6 +213,9 @@ def fetch_projects(token: str) -> Dict[str, str]:
     url = f"{API_BASE_REST}/projects"
     headers = {"Authorization": f"Bearer {token}"}
     data = _http_get_json(url, headers=headers)
+    # API v1 returns {"results": [...]} instead of plain list
+    if isinstance(data, dict) and "results" in data:
+        data = data["results"]
     out: Dict[str, str] = {}
     if isinstance(data, list):
         for p in data:
@@ -245,6 +248,9 @@ def fetch_projects_full(token: str) -> List[Dict[str, Any]]:
     url = f"{API_BASE_REST}/projects"
     headers = {"Authorization": f"Bearer {token}"}
     data = _http_get_json(url, headers=headers)
+    # API v1 returns {"results": [...]} instead of plain list
+    if isinstance(data, dict) and "results" in data:
+        data = data["results"]
     return data if isinstance(data, list) else []
 
 
