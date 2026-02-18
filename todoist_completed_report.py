@@ -38,7 +38,6 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
-API_BASE_SYNC = "https://api.todoist.com/sync/v10"
 API_BASE_REST = "https://api.todoist.com/api/v1"
 
 
@@ -286,90 +285,59 @@ def fetch_completed(
     *,
     since_iso_z: str,
     until_iso_z: str,
-    project_id: Optional[str] = None,
     limit: int = 200,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str], Dict[str, str]]:
     """
-    Returns (items, projects_map, sections_map)
-    items: list of completed items as returned by Todoist.
+    Returns (items, projects_map, sections_map) using the API v1 endpoint.
+    items: list of completed Task objects (description/parent_id embedded directly).
     projects_map: project_id(str)->name
     sections_map: section_id(str)->name
+
+    Uses cursor-based pagination. Project filtering must be done client-side
+    since the by_completion_date endpoint does not support a project_id filter.
     """
     headers = {"Authorization": f"Bearer {token}"}
-    url = f"{API_BASE_SYNC}/completed/get_all"
+    url = f"{API_BASE_REST}/tasks/completed/by_completion_date"
 
     items: List[Dict[str, Any]] = []
-    projects_map: Dict[str, str] = {}
-    sections_map: Dict[str, str] = {}
-
-    offset = 0
+    cursor: Optional[str] = None
     while True:
         params: Dict[str, Any] = {
             "since": since_iso_z,
             "until": until_iso_z,
             "limit": limit,
-            "offset": offset,
-            "include_task": "true",
-            # "annotate_notes": "true",  # Uncomment if you want notes (if supported)
         }
-        if project_id:
-            params["project_id"] = project_id
+        if cursor:
+            params["cursor"] = cursor
         data = _http_get_json(url, headers=headers, params=params)
         page_items = data.get("items", []) if isinstance(data, dict) else []
-        page_projects = data.get("projects", []) if isinstance(data, dict) else []
-        page_sections = data.get("sections", []) if isinstance(data, dict) else []
-        for it in page_items:
-            items.append(it)
-
-        # Normalize/merge projects (can be list[dict] or dict[id]->(name|dict))
-        if isinstance(page_projects, dict):
-            for pid_raw, p in page_projects.items():
-                pid = str(pid_raw)
-                if isinstance(p, dict):
-                    name = p.get("name") or p.get("project_name") or ""
-                else:
-                    name = str(p) if p is not None else ""
-                if pid:
-                    projects_map[pid] = name
-        elif isinstance(page_projects, list):
-            for p in page_projects:
-                if isinstance(p, dict):
-                    pid_val = p.get("id") or p.get("project_id") or p.get("projectid") or p.get("projectId") or p.get("project")
-                    pid = str(pid_val) if pid_val is not None else ""
-                    name = p.get("name") or p.get("project_name") or ""
-                    if pid:
-                        projects_map[pid] = name
-                else:
-                    pid = str(p)
-                    if pid:
-                        projects_map.setdefault(pid, f"Project {pid}")
-
-        # Normalize/merge sections (can be list[dict] or dict[id]->(name|dict))
-        if isinstance(page_sections, dict):
-            for sid_raw, s in page_sections.items():
-                sid = str(sid_raw)
-                if isinstance(s, dict):
-                    name = s.get("name") or ""
-                else:
-                    name = str(s) if s is not None else ""
-                if sid:
-                    sections_map[sid] = name
-        elif isinstance(page_sections, list):
-            for s in page_sections:
-                if isinstance(s, dict):
-                    sid_val = s.get("id") or s.get("section_id")
-                    sid = str(sid_val) if sid_val is not None else ""
-                    name = s.get("name") or ""
-                    if sid:
-                        sections_map[sid] = name
-                else:
-                    sid = str(s)
-                    if sid:
-                        sections_map.setdefault(sid, f"Section {sid}")
-
-        if not page_items or len(page_items) < limit:
+        items.extend(page_items)
+        cursor = data.get("next_cursor") if isinstance(data, dict) else None
+        if not cursor:
             break
-        offset += len(page_items)
+
+    # Projects are no longer embedded in the completed response; fetch separately.
+    projects_map: Dict[str, str] = {}
+    try:
+        projects_map = fetch_projects(token)
+    except Exception:
+        pass
+
+    # Sections are not embedded either; fetch all and index by id.
+    sections_map: Dict[str, str] = {}
+    section_ids = {str(it.get("section_id")) for it in items if it.get("section_id")}
+    if section_ids:
+        try:
+            sdata = _http_get_json(f"{API_BASE_REST}/sections", headers=headers)
+            if isinstance(sdata, dict) and "results" in sdata:
+                sdata = sdata["results"]
+            if isinstance(sdata, list):
+                for s in sdata:
+                    sid = str(s.get("id") or "")
+                    if sid:
+                        sections_map[sid] = s.get("name") or ""
+        except Exception:
+            pass
 
     return items, projects_map, sections_map
 
@@ -419,16 +387,24 @@ def fetch_task_details_bulk(token: str, ids: Iterable[str]) -> Dict[str, Dict[st
 
 def enrich_items_with_task_details(token: str, items: List[Dict[str, Any]], *, verbose: int = 0) -> Dict[str, Dict[str, Any]]:
     """
-    Ensure each completed item has a 'task' dict with at least description/parent_id when possible.
-    Also fetch parent task details so we can resolve parent titles even if the parent isn't in the timeframe.
-    Returns a dict of all fetched task details {task_id: task_dict}.
+    Ensure each completed item has description/parent_id when possible.
+    The new API v1 embeds these directly on each task object; for those items
+    no individual fetch is needed. Also fetches parent task details to resolve
+    parent titles even if the parent isn't in the timeframe.
+    Returns a dict of fetched task details {task_id: task_dict}.
     """
-    # Determine which items are missing useful task metadata
+    # Determine which items are missing useful task metadata.
+    # New-format items (from /tasks/completed/by_completion_date) always have
+    # 'description' and 'parent_id' as direct keys, so we skip them here.
     need_ids: set[str] = set()
     for it in items:
         tid = str(it.get("task_id") or it.get("id") or "")
         if not tid:
             continue
+        # New API format: description and parent_id are directly on the item.
+        if "description" in it and "parent_id" in it:
+            continue
+        # Old format: data may be in a nested 'task' dict.
         t = it.get("task")
         if not isinstance(t, dict) or (t.get("description") in (None, "") and t.get("parent_id") is None):
             need_ids.add(tid)
@@ -436,7 +412,7 @@ def enrich_items_with_task_details(token: str, items: List[Dict[str, Any]], *, v
     details: Dict[str, Dict[str, Any]] = {}
     if need_ids:
         details = fetch_task_details_bulk(token, need_ids)
-        # Attach details into items
+        # Attach details into items (old-format path only).
         for it in items:
             tid = str(it.get("task_id") or it.get("id") or "")
             if not tid:
@@ -445,16 +421,15 @@ def enrich_items_with_task_details(token: str, items: List[Dict[str, Any]], *, v
             if det:
                 t = it.get("task")
                 if isinstance(t, dict):
-                    # Merge with preference for existing 'task' fields
                     merged = {**det, **t}
                 else:
                     merged = det
                 it["task"] = merged
 
-    # Collect parent_ids and fetch details for those parents not already known
+    # Collect parent_ids from both new-format (direct key) and old-format (nested dict).
     parent_ids: set[str] = set()
     for it in items:
-        pid = (it.get("task") or {}).get("parent_id")
+        pid = it.get("parent_id") or (it.get("task") or {}).get("parent_id")
         if pid:
             parent_ids.add(str(pid))
 
@@ -681,16 +656,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"Warning: could not compute descendant project IDs: {e}", file=sys.stderr)
 
     if args.verbose:
-        if filter_ids:
-            print(f"Fetching completed tasks: since={since_iso_z}, until={until_iso_z}, project_id=ALL (client-side filter {len(filter_ids)} ids)", file=sys.stderr)
-        else:
-            print(f"Fetching completed tasks: since={since_iso_z}, until={until_iso_z}, project_id={project_id or 'ALL'}", file=sys.stderr)
+        filter_desc = f"client-side filter {len(filter_ids)} ids" if filter_ids else (f"client-side filter project={project_id}" if project_id else "ALL")
+        print(f"Fetching completed tasks: since={since_iso_z}, until={until_iso_z}, project={filter_desc}", file=sys.stderr)
 
     items, projects_map, sections_map = fetch_completed(
-        token, since_iso_z=since_iso_z, until_iso_z=until_iso_z, project_id=(None if filter_ids else project_id)
+        token, since_iso_z=since_iso_z, until_iso_z=until_iso_z
     )
+    # The new API endpoint does not support server-side project filtering;
+    # always filter client-side.
     if filter_ids:
         items = [it for it in items if str(it.get("project_id") or "") in filter_ids]
+    elif project_id:
+        items = [it for it in items if str(it.get("project_id") or "") == project_id]
 
     # If project was a NAME but could not be resolved, try filtering client-side by name
     if args.project and project_id is None:
