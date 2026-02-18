@@ -377,15 +377,24 @@ def fetch_completed(
 def fetch_task_detail(token: str, task_id: str) -> Optional[Dict[str, Any]]:
     """
     Fetch a single task (including completed/archived) via API v1.
-    Returns the task dict or None if not found.
+    Returns the task dict or None if not found/gone.
     """
     url = f"{API_BASE_REST}/tasks/{task_id}"
     headers = {"Authorization": f"Bearer {token}"}
     try:
         data = _http_get_json(url, headers=headers)
     except HTTPError as e:
-        if e.code == 404:
+        if e.code in (404, 410):
+            # 404 = not found, 410 = Gone (e.g. deprecated v2 ID no longer valid in v1)
             return None
+        if e.code == 400:
+            # May be V1_ID_CANNOT_BE_USED for deprecated v2 IDs
+            try:
+                body = json.loads(e.read())
+                if body.get("error_tag") == "V1_ID_CANNOT_BE_USED":
+                    return None
+            except Exception:
+                pass
         raise
     except URLError:
         return None
