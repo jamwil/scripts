@@ -112,7 +112,7 @@ def db_get_topic_by_gh(con: sqlite3.Connection, gh_id: str) -> Optional[tuple[st
     row = cur.fetchone()
     return (row[0], row[1]) if row else None
 
-def db_set_todoist_id(con: sqlite3.Connection, gh_id: str, todoist_id: str) -> None:
+def db_set_todoist_id(con: sqlite3.Connection, gh_id: str, todoist_id: Optional[str]) -> None:
     con.execute("UPDATE topics SET todoist_id=?, last_synced_at=? WHERE gh_id=?", (todoist_id, _now_iso(), gh_id))
     con.commit()
 
@@ -175,27 +175,37 @@ def gh_search_assigned(since: Optional[datetime], gh_path: Optional[str]) -> lis
     items.extend(json.loads(out_prs))
 
     # Also fetch recently updated (captures closures/renames/label changes).
+    # Use an overlap window so we can recover from missed runs/bugs without losing events.
+    overlap = timedelta(days=7)
+    now = datetime.now(UTC)
     if since is None:
-        since = datetime.now(UTC) - timedelta(days=30)
+        since = now - timedelta(days=30)
+    else:
+        since = since.astimezone(UTC) - overlap
     since_q = since.strftime("%Y-%m-%dT%H:%M:%SZ")
-    out_recent = gh_cmd(
-        "search","issues",
-        f"updated:>={since_q} assignee:@me",
-        "--assignee","@me",
-        "--json", fields,
-        "--limit","1000",
-        gh_path=gh_path
-    )
-    items.extend(json.loads(out_recent))
-    out_recent_prs = gh_cmd(
-        "search","prs",
-        f"updated:>={since_q} assignee:@me",
-        "--assignee","@me",
-        "--json", fields,
-        "--limit","1000",
-        gh_path=gh_path
-    )
-    items.extend(json.loads(out_recent_prs))
+    for state in ("open", "closed"):
+        out_recent = gh_cmd(
+            "search","issues",
+            f"updated:>={since_q} assignee:@me",
+            "--assignee","@me",
+            "--state", state,
+            "--json", fields,
+            "--limit","1000",
+            gh_path=gh_path
+        )
+        items.extend(json.loads(out_recent))
+
+    for state in ("open", "closed"):
+        out_recent_prs = gh_cmd(
+            "search","prs",
+            f"updated:>={since_q} assignee:@me",
+            "--assignee","@me",
+            "--state", state,
+            "--json", fields,
+            "--limit","1000",
+            gh_path=gh_path
+        )
+        items.extend(json.loads(out_recent_prs))
 
 
     topics: dict[str, Topic] = {}
@@ -327,13 +337,25 @@ class Todoist:
         return None
 
     def _is_deprecated_id(self, r: httpx.Response) -> bool:
-        """Check if response indicates a deprecated v2 ID that can't be used with v1 API."""
-        if r.status_code == 400:
-            try:
-                data = r.json()
-                return data.get("error_tag") == "V1_ID_CANNOT_BE_USED"
-            except Exception:
-                pass
+        """Check if response indicates a stored task_id that is unusable for this API."""
+        if r.status_code != 400:
+            return False
+        try:
+            data = r.json()
+        except Exception:
+            return False
+
+        # Explicit Todoist signal for legacy IDs.
+        if data.get("error_tag") == "V1_ID_CANNOT_BE_USED":
+            return True
+
+        # Some legacy/invalid IDs come back as INVALID_ARGUMENT_VALUE with task_id details,
+        # e.g. expected: "Value error, Non-base32 digit found".
+        if data.get("error_tag") == "INVALID_ARGUMENT_VALUE":
+            extra = data.get("error_extra") or {}
+            if extra.get("argument") == "task_id":
+                return True
+
         return False
 
     def update_task(self, task_id: str, *, content: Optional[str]=None, description: Optional[str]=None, labels: Optional[list[str]]=None) -> tuple[bool, bool]:
@@ -473,6 +495,7 @@ def sync(
     project: Optional[str] = typer.Option(None, "--project", help="Todoist project name (default: Inbox)"),
     db_path: Path = typer.Option(_default_db_path(), "--db", help="SQLite state path"),
     gh: Optional[str] = typer.Option(None, "--gh", help="Path to gh(1); defaults to $GH_PATH or 'gh'"),
+    resync_days: Optional[int] = typer.Option(None, "--resync-days", min=1, help="Ignore stored last_sync and re-scan updated items for the last N days (useful to recover from missed closures)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="No writes to Todoist / DB"),
     verbose: int = typer.Option(0, "-v", count=True, help="-v or -vv for more logs"),
 ):
@@ -487,9 +510,20 @@ def sync(
     con = db_open(db_path)
     last_sync_s = db_get(con, "last_sync_iso")
     last_sync = datetime.fromisoformat(last_sync_s).astimezone(UTC) if last_sync_s else None
-    log.info("starting", last_sync_iso=last_sync_s or None, dry_run=dry_run)
 
-    topics = gh_search_assigned(last_sync, gh_path=gh)
+    since = last_sync
+    if resync_days is not None:
+        since = datetime.now(UTC) - timedelta(days=resync_days)
+
+    log.info(
+        "starting",
+        last_sync_iso=last_sync_s or None,
+        effective_since_iso=since.isoformat() if since else None,
+        resync_days=resync_days,
+        dry_run=dry_run,
+    )
+
+    topics = gh_search_assigned(since, gh_path=gh)
     log.info("github_items_fetched", count=len(topics))
 
     td = Todoist(token)
