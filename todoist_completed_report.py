@@ -15,6 +15,7 @@ Features:
   - Default is the last 7 days up to now
 - Project filter by name or ID via --project. If name is provided, it is resolved via REST API.
 - Output formats: markdown (default) or jsonl.
+- Optional `--comments` fetches each task's comments (notes) and includes them in the output (one extra request per task).
 - Handles pagination and basic rate limiting (HTTP 429) with retries.
 
 Examples:
@@ -448,6 +449,67 @@ def enrich_items_with_task_details(token: str, items: List[Dict[str, Any]], *, v
     return details
 
 
+def fetch_task_comments(token: str, task_id: str, *, limit: int = 200) -> List[Dict[str, Any]]:
+    """
+    Fetch all comments for a single task via API v1.
+
+    Uses GET /comments?task_id=<id> with cursor-based pagination (the endpoint
+    returns {"results": [...], "next_cursor": ...}). Excludes comments marked
+    is_deleted. Returns [] if the task is gone (404/410) or unavailable
+    (e.g. deprecated v2 IDs that can't be used in v1).
+    """
+    url = f"{API_BASE_REST}/comments"
+    headers = {"Authorization": f"Bearer {token}"}
+    out: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    while True:
+        params: Dict[str, Any] = {"task_id": task_id, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            data = _http_get_json(url, headers=headers, params=params)
+        except HTTPError as e:
+            if e.code in (404, 410):
+                return []
+            if e.code == 400:
+                try:
+                    body = json.loads(e.read())
+                    if body.get("error_tag") == "V1_ID_CANNOT_BE_USED":
+                        return []
+                except Exception:
+                    pass
+            raise
+        page = data.get("results", []) if isinstance(data, dict) else []
+        out.extend(c for c in page if not c.get("is_deleted"))
+        cursor = data.get("next_cursor") if isinstance(data, dict) else None
+        if not cursor:
+            break
+    return out
+
+
+def fetch_comments_bulk(token: str, task_ids: Iterable[str], *, verbose: int = 0) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Fetch comments for multiple tasks (one request per task; REST has no batch endpoint).
+    Returns a mapping task_id -> list of comment dicts, sorted by posted_at ascending.
+    """
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for tid in task_ids:
+        tid_str = str(tid or "")
+        if not tid_str:
+            continue
+        comments = fetch_task_comments(token, tid_str)
+        # Normalize/sort by posted_at (oldest first) when available.
+        comments = sorted(
+            comments,
+            key=lambda c: c.get("posted_at") or c.get("added_at") or "",
+        )
+        out[tid_str] = comments
+    if verbose:
+        total = sum(len(v) for v in out.values())
+        print(f"Info: fetched {total} comment(s) across {len(out)} task(s).", file=sys.stderr)
+    return out
+
+
 def _clean_content(s: str) -> str:
     s = s.replace("\r\n", " ").replace("\n", " ").strip()
     return " ".join(s.split())
@@ -482,6 +544,7 @@ def output_markdown(
     until_iso_z: str,
     project_label: Optional[str],
     task_details: Optional[Dict[str, Dict[str, Any]]] = None,
+    comments_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> None:
     by_day = _group_by_day(items)
     total = sum(len(v) for v in by_day.values())
@@ -539,6 +602,20 @@ def output_markdown(
             if description:
                 desc_indent = "    " if is_subtask else "  "
                 print(f"{desc_indent}- Description: {description}")
+            # Comments (task notes)
+            task_id_str = str(it.get("task_id") or it.get("id") or "")
+            if comments_map and task_id_str:
+                tcomments = comments_map.get(task_id_str) or []
+                if tcomments:
+                    comment_indent = "    " if is_subtask else "  "
+                    for c in tcomments:
+                        ccontent = _clean_content(str(c.get("content", "")))
+                        if not ccontent:
+                            continue
+                        posted = c.get("posted_at") or c.get("added_at") or ""
+                        posted_day = posted[:10] if posted else ""
+                        suffix = f" ({posted_day})" if posted_day else ""
+                        print(f"{comment_indent}- Comment{suffix}: {ccontent}")
         print()
 
 
@@ -551,6 +628,7 @@ def output_jsonl(
     until_iso_z: str,
     project_label: Optional[str],
     task_details: Optional[Dict[str, Dict[str, Any]]] = None,
+    comments_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> None:
     meta = {
         "type": "todoist_completed_tasks",
@@ -586,18 +664,28 @@ def output_jsonl(
         parent_id_str = str(parent_id_val or "")
         is_subtask = bool(parent_id_str)
         parent_content = id_to_content.get(parent_id_str) if is_subtask else None
+        task_id_str = str(it.get("task_id") or it.get("id") or "")
+        comments_out: List[Dict[str, Any]] = []
+        if comments_map and task_id_str:
+            for c in comments_map.get(task_id_str, []):
+                comments_out.append({
+                    "posted_at": c.get("posted_at") or c.get("added_at"),
+                    "posted_uid": c.get("posted_uid"),
+                    "content": _clean_content(str(c.get("content", ""))),
+                })
         record = {
             "completed_at": it.get("completed_at"),
             "project_id": pid or None,
             "project_name": projects.get(pid),
             "section_id": sid or None,
             "section_name": sections.get(sid),
-            "task_id": str(it.get("task_id") or it.get("id") or ""),
+            "task_id": task_id_str,
             "content": _clean_content(str(it.get("content", ""))),
             "description": description or None,
             "parent_id": parent_id_str or None,
             "parent_content": parent_content,
             "is_subtask": is_subtask,
+            "comments": comments_out,
         }
         print(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
 
@@ -613,6 +701,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--week", help="ISO week: 'this', 'last', or 'YYYY-Www' (e.g., 2025-W33).")
     ap.add_argument("--last-week", action="store_true", help="Use the previous ISO week (Mon..Sun).")
     ap.add_argument("--format", "-f", choices=("markdown", "jsonl"), default="markdown", help="Output format.")
+    ap.add_argument("--comments", action="store_true", help="Fetch and include task comments (one extra request per task).")
     ap.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity (can use -vv).")
 
     args = ap.parse_args(argv)
@@ -700,13 +789,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Enrich items with task details (description, parent_id) when not provided by completed API
     task_details = enrich_items_with_task_details(token, items, verbose=args.verbose)
 
+    # Optionally fetch task comments (one request per task)
+    comments_map: Dict[str, List[Dict[str, Any]]] = {}
+    if args.comments and items:
+        comment_ids = [str(it.get("task_id") or it.get("id") or "") for it in items]
+        comment_ids = [cid for cid in comment_ids if cid]
+        try:
+            comments_map = fetch_comments_bulk(token, comment_ids, verbose=args.verbose)
+        except Exception as e:
+            if args.verbose:
+                print(f"Warning: failed to fetch comments: {e}", file=sys.stderr)
+            comments_map = {}
+
     # Sort items by completion time
     items.sort(key=lambda x: x.get("completed_at", ""))
 
     if args.format == "markdown":
-        output_markdown(items, projects_map, sections_map, since_iso_z=since_iso_z, until_iso_z=until_iso_z, project_label=project_label, task_details=task_details)
+        output_markdown(items, projects_map, sections_map, since_iso_z=since_iso_z, until_iso_z=until_iso_z, project_label=project_label, task_details=task_details, comments_map=comments_map or None)
     else:
-        output_jsonl(items, projects_map, sections_map, since_iso_z=since_iso_z, until_iso_z=until_iso_z, project_label=project_label, task_details=task_details)
+        output_jsonl(items, projects_map, sections_map, since_iso_z=since_iso_z, until_iso_z=until_iso_z, project_label=project_label, task_details=task_details, comments_map=comments_map or None)
 
     return 0
 
